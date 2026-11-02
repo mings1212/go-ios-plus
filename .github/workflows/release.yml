@@ -1,300 +1,96 @@
-# Release pipeline — manual dispatch only.
+# Release pipeline — simplified for personal fork.
 #
-# Run it from the Actions tab (or `gh workflow run release.yml -f release_notes=... -f bump=patch`).
-# The workflow owns the version and the changelog: it computes the next version
-# from the latest tag, writes a "## [version] - date" section with your notes
-# into CHANGELOG.md, pushes that to main, tags it, creates the GitHub release
-# with those notes, publishes to npm via OIDC trusted publishing, and finally
-# verifies the published package installs and runs on all three OSes.
+# 单 job 全平台交叉编译（linux runner 上 GOOS/GOARCH 交叉编译 win/mac/linux），
+# 产物 zip 直接挂到 GitHub Release，使用默认 GITHUB_TOKEN，无需配置任何 secret。
 #
-# All repo-mutating and outbound steps live in release_and_publish (the last
-# job before verify), so a failed build leaves nothing pushed or published.
+# 触发：Actions → Release-Go-iOS → Run workflow
+#   或 `gh workflow run release.yml -f version=0.1.0 -f release_notes="- xxx"`
+# 版本号：优先取输入的 version；留空则取最新 v* tag 做 minor bump；无 tag 时从 0.1.0 开始。
 #
-# Requires the RELEASE_PAT secret: a fine-grained PAT (Contents: read/write on
-# this repo) from an admin account. main is a protected branch; since
-# enforce_admins is off, an admin token can push the changelog commit to it.
+# 注意：macOS 的 lipo（合并通用二进制）只能在 mac runner 上执行，这里改为
+# arm64/amd64 两个独立 zip；如需通用二进制需自行在 mac 上合并。
 on:
   workflow_dispatch:
     inputs:
-      release_notes:
-        description: "Release notes (markdown). Written into CHANGELOG.md and used as the GitHub release body."
-        required: true
+      version:
+        description: "版本号（如 0.1.0），留空则自动从最新 v* tag bump"
+        required: false
         type: string
-      bump:
-        description: "Which semver part to bump from the latest tag"
-        required: true
-        default: patch
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
+      release_notes:
+        description: "Release notes (markdown)"
+        required: false
+        type: string
 
 name: Release-Go-iOS
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  prepare_version:
+  build_and_release:
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.compute.outputs.version }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: main
-          fetch-depth: 0 # need all tags to find the latest
+          fetch-depth: 0 # 需要全部 tag 计算版本号
 
-      - name: Compute next version
-        id: compute
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compute version
+        id: ver
         run: |
           set -euo pipefail
-          LATEST="$(git tag -l 'v*' | sort -V | tail -1)"
-          LATEST="${LATEST#v}"
-          IFS=. read -r MA MI PA <<< "$LATEST"
-          case "${{ inputs.bump }}" in
-            major) MA=$((MA + 1)); MI=0; PA=0 ;;
-            minor) MI=$((MI + 1)); PA=0 ;;
-            patch) PA=$((PA + 1)) ;;
-          esac
-          NEXT="${MA}.${MI}.${PA}"
-          echo "version=${NEXT}" >> "$GITHUB_OUTPUT"
-          echo "Latest tag v${LATEST} -> next v${NEXT} (${{ inputs.bump }} bump)"
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            LATEST="$(git tag -l 'v*' | sort -V | tail -1)"
+            LATEST="${LATEST#v}"
+            if [ -z "$LATEST" ]; then
+              LATEST="0.0.0"
+            fi
+            IFS=. read -r MA MI PA <<< "$LATEST"
+            VERSION="${MA}.${MI}.$((PA + 1))"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Release version: v${VERSION}"
 
-  build_on_windows:
-    runs-on: windows-latest
-    needs: prepare_version
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Build
-        run: |
-          ((Get-Content -path main.go -Raw) -replace "local-build","${{ needs.prepare_version.outputs.version }}") | Set-Content -Path main.go
-          mkdir bin
-          go build -ldflags="-s -w" -o bin/ios.exe
-          Compress-Archive -Path .\bin\ios.exe -CompressionLevel Optimal -DestinationPath go-ios-windows.zip
-
-      - name: upload the windows build
-        uses: actions/upload-artifact@v7
-        with:
-          name: windows-build
-          path: go-ios-windows.zip
-          retention-days: 1
-          overwrite: true
-
-  build_on_mac:
-    runs-on: macos-latest
-    needs: [prepare_version, build_on_windows]
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Build
-        run: |
-          brew install gnu-sed
-          gsed -i 's/version \= \"local-build\"/version = \"${{ needs.prepare_version.outputs.version }}\"/' main.go
-          mkdir bin
-          GOARCH=arm64 go build -ldflags="-s -w" -o bin/ios-arm64
-          GOARCH=amd64 go build -ldflags="-s -w" -o bin/ios-amd64
-          lipo bin/ios-amd64 bin/ios-arm64 -create -output bin/ios
-          zip -j go-ios-mac.zip bin/ios
-
-      - name: upload the macos build
-        uses: actions/upload-artifact@v7
-        with:
-          name: macos-build
-          path: go-ios-mac.zip
-          retention-days: 1
-          overwrite: true
-
-  release_and_publish:
-    runs-on: ubuntu-latest
-    needs: [prepare_version, build_on_mac]
-    permissions:
-      contents: write
-      id-token: write # OIDC token for npm trusted publishing
-    env:
-      VERSION: ${{ needs.prepare_version.outputs.version }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: main
-          fetch-depth: 0
-          token: ${{ secrets.RELEASE_PAT }} # admin token, can push to protected main
-
-      - name: Install Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Download mac build from previous job
-        uses: actions/download-artifact@v8
-        with:
-          name: macos-build
-          path: ./mac-bin
-
-      - name: Download windows build from previous job
-        uses: actions/download-artifact@v8
-        with:
-          name: windows-build
-          path: ./win-bin
-
-      - name: Build linux and package all artifacts
+      - name: Build all platforms
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
           sed -i 's/version \= \"local-build\"/version = \"'"${VERSION}"'\"/' main.go
-          mkdir bin
-          GOARCH=arm64 go build -ldflags="-s -w" -o bin/ios-arm64
-          GOARCH=amd64 go build -ldflags="-s -w" -o bin/ios-amd64
-          ( cd mac-bin && unzip -o go-ios-mac.zip && rm go-ios-mac.zip && zip -j ../go-ios-mac.zip ios )
-          ( cd win-bin && unzip -o go-ios-windows.zip && zip -j ../go-ios-win.zip ios.exe )
-          zip -j go-ios-linux.zip bin/ios-arm64 bin/ios-amd64
-
-      - name: Update CHANGELOG, commit, and tag
-        env:
-          RELEASE_NOTES: ${{ inputs.release_notes }}
-        run: |
-          set -euo pipefail
-          DATE="$(date +%Y-%m-%d)"
-          printf '%s\n' "$RELEASE_NOTES" > /tmp/notes.md
-          # Insert a new "## [VERSION] - DATE" section just before the most recent
-          # released version (the first "## [x.y.z]" heading). This keeps any
-          # existing "## [Unreleased]" content under [Unreleased] instead of
-          # absorbing it into the new section.
-          awk -v hdr="## [${VERSION}] - ${DATE}" -v notesfile="/tmp/notes.md" '
-            /^## \[[0-9]/ && !done {
-              print hdr
-              print ""
-              while ((getline line < notesfile) > 0) print line
-              print ""
-              done = 1
-            }
-            { print }
-          ' CHANGELOG.md > CHANGELOG.new
-          mv CHANGELOG.new CHANGELOG.md
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add CHANGELOG.md
-          git commit -m "chore(release): v${VERSION}"
-          git push origin HEAD:main
-          git tag "v${VERSION}"
-          git push origin "v${VERSION}"
+          mkdir -p bin
+          LDFLAGS="-s -w"
+          # windows
+          GOOS=windows GOARCH=amd64 go build -ldflags="$LDFLAGS" -o bin/ios.exe .
+          zip -j go-ios-win.zip bin/ios.exe
+          # mac（arm64 + amd64 分开打包）
+          GOOS=darwin GOARCH=arm64 go build -ldflags="$LDFLAGS" -o bin/ios-arm64 .
+          GOOS=darwin GOARCH=amd64 go build -ldflags="$LDFLAGS" -o bin/ios-amd64 .
+          zip -j go-ios-mac-arm64.zip bin/ios-arm64
+          zip -j go-ios-mac-amd64.zip bin/ios-amd64
+          # linux
+          GOOS=linux GOARCH=amd64 go build -ldflags="$LDFLAGS" -o bin/ios-linux-amd64 .
+          GOOS=linux GOARCH=arm64 go build -ldflags="$LDFLAGS" -o bin/ios-linux-arm64 .
+          zip -j go-ios-linux.zip bin/ios-linux-amd64 bin/ios-linux-arm64
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          gh release create "v${VERSION}" \
-            go-ios-linux.zip go-ios-mac.zip go-ios-win.zip \
-            --title "v${VERSION}" \
-            --notes-file /tmp/notes.md
-
-      # OIDC trusted publishing needs Node >= 22.14.0 and npm >= 11.5.1.
-      - name: Set up Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Publish NPM
-        run: |
-          set -euo pipefail
-          npm install -g npm@latest
-          mkdir ./npm_publish/dist
-          mkdir ./npm_publish/dist/go-ios-darwin-amd64_darwin_amd64
-          mkdir ./npm_publish/dist/go-ios-darwin-arm64_darwin_arm64
-          mkdir ./npm_publish/dist/go-ios-linux-amd64_linux_amd64
-          mkdir ./npm_publish/dist/go-ios-linux-arm64_linux_arm64
-          mkdir ./npm_publish/dist/go-ios-windows-amd64_windows_amd64
-          cp ./mac-bin/ios ./npm_publish/dist/go-ios-darwin-amd64_darwin_amd64/ios
-          cp ./mac-bin/ios ./npm_publish/dist/go-ios-darwin-arm64_darwin_arm64/ios
-          cp ./win-bin/ios.exe ./npm_publish/dist/go-ios-windows-amd64_windows_amd64/ios.exe
-          cp ./bin/ios-amd64 ./npm_publish/dist/go-ios-linux-amd64_linux_amd64/ios
-          cp ./bin/ios-arm64 ./npm_publish/dist/go-ios-linux-arm64_linux_arm64/ios
-          cp ./README.md ./npm_publish
-          cd npm_publish
-          sed -i 's/\"local-build\"/\"'"${VERSION}"'\"/' package.json
-          npm install
-          # No NODE_AUTH_TOKEN / .npmrc auth line: npm authenticates via OIDC
-          # trusted publishing. Setting an (even empty) token would break OIDC.
-          npm publish
-
-  # Post-publish smoke test: install the freshly released go-ios from the public
-  # registry on every OS and run the binary, asserting the version matches.
-  verify_install:
-    needs: [prepare_version, release_and_publish]
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Set up Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Install published release and run it
-        shell: bash
-        env:
-          EXPECTED_VERSION: ${{ needs.prepare_version.outputs.version }}
-        run: |
-          set -euo pipefail
-          # npm registry propagation to all replicas can lag well past a minute
-          # right after publish. Give it a 60s head start, then retry generously.
-          echo "waiting 60s for npm registry propagation before first install..."
-          sleep 60
-          for i in $(seq 1 12); do
-            if npm install -g "go-ios@${EXPECTED_VERSION}"; then
-              break
-            fi
-            echo "install attempt $i failed (version may not have propagated yet), retrying in 15s..."
-            sleep 15
-          done
-
-          OUTPUT="$(ios version 2>&1)"
-          echo "ios version output: $OUTPUT"
-          echo "$OUTPUT" | grep -q "\"version\":\"${EXPECTED_VERSION}\"" \
-            || { echo "::error::expected version ${EXPECTED_VERSION} not found in 'ios version' output"; exit 1; }
-          echo "OK: go-ios@${EXPECTED_VERSION} installed and runs on ${{ matrix.os }}"
-
-  notify_discord:
-    needs: [prepare_version, release_and_publish, verify_install]
-    if: success()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Notify Discord
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          VERSION: ${{ needs.prepare_version.outputs.version }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
-            echo "DISCORD_WEBHOOK_URL is not set; skipping Discord notification."
-            exit 0
+          if [ -z "${{ inputs.release_notes }}" ]; then
+            printf 'go-ios-plus v%s\n' "${VERSION}" > /tmp/notes.md
+          else
+            printf '%s' "${{ inputs.release_notes }}" > /tmp/notes.md
           fi
-          NOTES="$(printf '%s' "$RELEASE_NOTES" | head -c 3500)"
-          jq -n \
-            --arg title "go-ios v${VERSION} released" \
-            --arg desc "$NOTES" \
-            --arg url "https://github.com/${REPO}/releases/tag/v${VERSION}" \
-            '{embeds: [{title: $title, description: $desc, url: $url, color: 3447003}]}' \
-          | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
+          gh release create "v${VERSION}" \
+            go-ios-win.zip go-ios-mac-arm64.zip go-ios-mac-amd64.zip go-ios-linux.zip \
+            --title "v${VERSION}" \
+            --notes-file /tmp/notes.md \
+            --target "$GITHUB_SHA"
