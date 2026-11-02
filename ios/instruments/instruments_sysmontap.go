@@ -29,6 +29,12 @@ type sysmontapService struct {
 
 	deviceInfoService *DeviceInfoService
 	msgDispatcher     *sysmontapMsgDispatcher
+	procAttrs         []interface{}
+
+	// bundleID filters per-app memory metrics when non-empty; appPID caches
+	// the resolved pid between samples and is owned by the reader goroutine.
+	bundleID string
+	appPID   uint64
 }
 
 // NewSysmontapService creates a new sysmontapService
@@ -88,7 +94,7 @@ func NewSysmontapService(device ios.DeviceEntry, samplingInterval int) (*sysmont
 		return nil, err
 	}
 
-	return &sysmontapService{processControlChannel, dtxConn, deviceInfoService, msgDispatcher}, nil
+	return &sysmontapService{processControlChannel, dtxConn, deviceInfoService, msgDispatcher, procAttrs, "", 0}, nil
 }
 
 // Close closes up the DTX connection, message dispatcher and dtx.Message channel
@@ -108,10 +114,14 @@ func (s *sysmontapService) ReceiveCPUUsage() chan SysmontapMessage {
 		defer close(messages)
 
 		for msg := range s.msgDispatcher.messages {
-			sysmontapMessage, err := mapToCPUUsage(msg)
+			sysmontapMessage, err := mapToSysmontapMessage(msg, s.procAttrs)
 			if err != nil {
 				golog.Debug("expected `sysmontapMessage` from global channel, but received different message", "module", logModule, "message", msg)
 				continue
+			}
+
+			if s.bundleID != "" {
+				s.applyAppBundle(&sysmontapMessage)
 			}
 
 			messages <- sysmontapMessage
@@ -130,6 +140,25 @@ type SysmontapMessage struct {
 	EndMachAbsTime uint64
 	Type           uint64
 	SystemCPUUsage CPUUsage
+	// Processes holds per-process memory metrics keyed by pid. It is nil when
+	// the device did not include process-level data in this sample.
+	Processes map[uint64]ProcessMemInfo
+	// AppPID and AppPhysFootprint are set only when a bundle id filter is
+	// active. AppPID is 0 when the app was not found in this sample.
+	AppPID           uint64
+	AppPhysFootprint uint64
+	// AppCPUUsage is the target app's CPU load in percent of one full core
+	// (can exceed 100 for multi-threaded apps). 0 when unavailable.
+	AppCPUUsage float64
+}
+
+// ProcessMemInfo holds per-process memory metrics in bytes.
+type ProcessMemInfo struct {
+	PhysFootprint uint64
+	MemResident   uint64
+	// CPUUsage is the process CPU load in percent of one full core, derived
+	// from the "CPU" procAttr's cpuUsage value. 0 when not requested.
+	CPUUsage float64
 }
 
 type CPUUsage struct {
@@ -229,10 +258,85 @@ func extractResultMap(payload []interface{}) (map[string]interface{}, error) {
 	return resultMap, nil
 }
 
-// mapToCPUUsage parses a DTX sysmontap message into a SysmontapMessage.
+// SetBundleID enables per-app memory filtering. When set, each sample is
+// annotated with the target app's pid (AppPID) and phys footprint
+// (AppPhysFootprint). Must be called before ReceiveCPUUsage.
+func (s *sysmontapService) SetBundleID(bundleID string) {
+	s.bundleID = bundleID
+}
+
+// resolveAppPID looks up the pid of the app whose bundle id matches s.bundleID
+// via the ProcessList. App processes report their bundle id as Name.
+func (s *sysmontapService) resolveAppPID() (uint64, bool) {
+	procs, err := s.deviceInfoService.ProcessList()
+	if err != nil {
+		return 0, false
+	}
+	for _, p := range procs {
+		if p.IsApplication && p.Name == s.bundleID {
+			return p.Pid, true
+		}
+	}
+	return 0, false
+}
+
+// applyAppBundle annotates the sample with the target app's pid and
+// physFootprint. The pid is cached between samples and re-resolved only when
+// the app disappears from a sample, so a cold start (which changes the pid) is
+// picked up automatically while avoiding a ProcessList call per sample.
+func (s *sysmontapService) applyAppBundle(msg *SysmontapMessage) {
+	if msg.Processes == nil {
+		return
+	}
+	info, ok := msg.Processes[s.appPID]
+	if !ok {
+		pid, found := s.resolveAppPID()
+		if !found {
+			return
+		}
+		s.appPID = pid
+		info, ok = msg.Processes[s.appPID]
+		if !ok {
+			// The fresh pid is not in this sample yet (race between the two
+			// instrument calls); the next sample will pick it up.
+			return
+		}
+	}
+	msg.AppPID = s.appPID
+	msg.AppPhysFootprint = info.PhysFootprint
+	msg.AppCPUUsage = info.CPUUsage
+}
+
+// parseProcessCPU extracts the per-process CPU load from the "CPU" procAttr
+// value. Instruments returns a dict {"cpuUsage": <fraction of one core>,
+// "cpuTotalLoad": <fraction of all cores>}; some iOS versions may send a plain
+// number instead. The result is converted to percent of one full core.
+func parseProcessCPU(v interface{}) float64 {
+	switch m := v.(type) {
+	case map[string]interface{}:
+		f, _ := toFloat64(m["cpuUsage"])
+		return f * 100
+	case map[interface{}]interface{}:
+		f, _ := toFloat64(m["cpuUsage"])
+		return f * 100
+	}
+	if f, ok := toFloat64(v); ok {
+		return f * 100
+	}
+	return 0
+}
+
+// mapToCPUUsage parses a DTX sysmontap message into a SysmontapMessage without
+// per-process data. Kept for compatibility with existing callers and tests.
+func mapToCPUUsage(msg dtx.Message) (SysmontapMessage, error) {
+	return mapToSysmontapMessage(msg, nil)
+}
+
+// mapToSysmontapMessage parses a DTX sysmontap message into a SysmontapMessage,
+// including per-process memory data when procAttrs is provided.
 // It tolerates numeric type variations (int, int64, uint32, float64, etc.)
 // across different iOS versions and device types.
-func mapToCPUUsage(msg dtx.Message) (SysmontapMessage, error) {
+func mapToSysmontapMessage(msg dtx.Message, procAttrs []interface{}) (SysmontapMessage, error) {
 	resultMap, err := extractResultMap(msg.Payload)
 	if err != nil {
 		return SysmontapMessage{}, err
@@ -264,11 +368,79 @@ func mapToCPUUsage(msg dtx.Message) (SysmontapMessage, error) {
 		return SysmontapMessage{}, err
 	}
 
-	return SysmontapMessage{
+	sysmontapMessage := SysmontapMessage{
 		CPUCount:       cpuCount,
 		EnabledCPUs:    enabledCPUs,
 		EndMachAbsTime: endMachAbsTime,
 		Type:           typ,
 		SystemCPUUsage: CPUUsage{CPU_TotalLoad: cpuTotalLoad},
-	}, nil
+		Processes:      parseProcesses(resultMap, procAttrs),
+	}
+	return sysmontapMessage, nil
+}
+
+// attrIndex returns the index of name in attrs, or -1 if absent.
+func attrIndex(attrs []interface{}, name string) int {
+	for i, attr := range attrs {
+		if s, ok := attr.(string); ok && s == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// parseProcesses extracts per-process memory info from the "Processes" dict of
+// a sysmontap sample. The device returns a map keyed by pid where each value is
+// an array aligned with the procAttrs list requested in setConfig. Returns nil
+// when process data is absent or neither footprint attribute was requested.
+func parseProcesses(resultMap map[string]interface{}, procAttrs []interface{}) map[uint64]ProcessMemInfo {
+	footprintIdx := attrIndex(procAttrs, "physFootprint")
+	residentIdx := attrIndex(procAttrs, "memResidentSize")
+	cpuIdx := attrIndex(procAttrs, "CPU")
+	if footprintIdx < 0 && residentIdx < 0 && cpuIdx < 0 {
+		return nil
+	}
+	raw, exists := resultMap["Processes"]
+	if !exists {
+		return nil
+	}
+
+	processes := map[uint64]ProcessMemInfo{}
+	addSample := func(pid interface{}, values interface{}) {
+		pidNum, ok := toUint64(pid)
+		if !ok {
+			return
+		}
+		attrValues, ok := values.([]interface{})
+		if !ok {
+			return
+		}
+		info := ProcessMemInfo{}
+		if footprintIdx >= 0 && footprintIdx < len(attrValues) {
+			info.PhysFootprint, _ = toUint64(attrValues[footprintIdx])
+		}
+		if residentIdx >= 0 && residentIdx < len(attrValues) {
+			info.MemResident, _ = toUint64(attrValues[residentIdx])
+		}
+		if cpuIdx >= 0 && cpuIdx < len(attrValues) {
+			info.CPUUsage = parseProcessCPU(attrValues[cpuIdx])
+		}
+		processes[pidNum] = info
+	}
+
+	switch procs := raw.(type) {
+	case map[string]interface{}:
+		for pid, values := range procs {
+			addSample(pid, values)
+		}
+	case map[interface{}]interface{}:
+		for pid, values := range procs {
+			addSample(pid, values)
+		}
+	}
+
+	if len(processes) == 0 {
+		return nil
+	}
+	return processes
 }

@@ -171,5 +171,5 @@ func runLockdownCommand(ctx commandContext) {
 }
 
 func runSysmontapCommand(ctx commandContext) {
-	printSysmontapStats(ctx.Device)
+	printSysmontapStats(ctx)
 }

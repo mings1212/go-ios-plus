@@ -666,13 +666,17 @@ func Main() {
 	}
 }
 
-func printSysmontapStats(device ios.DeviceEntry) {
+func printSysmontapStats(ctx commandContext) {
+	bundleID, _ := ctx.Args.String("--bundleid")
 	const xcodeDefaultSamplingRate = 10
-	sysmon, err := instruments.NewSysmontapService(device, xcodeDefaultSamplingRate)
+	sysmon, err := instruments.NewSysmontapService(ctx.Device, xcodeDefaultSamplingRate)
 	if err != nil {
 		exitIfError("systemMonitor creation error", err)
 	}
 	defer sysmon.Close()
+	if bundleID != "" {
+		sysmon.SetBundleID(bundleID)
+	}
 
 	cpuUsageChannel := sysmon.ReceiveCPUUsage()
 
@@ -688,12 +692,31 @@ func printSysmontapStats(device ios.DeviceEntry) {
 				slog.Info("CPU usage channel closed.")
 				return
 			}
-			slog.Info("received CPU usage data",
+			var totalFootprint uint64
+			var maxFootprint uint64
+			for _, proc := range cpuUsageMsg.Processes {
+				totalFootprint += proc.PhysFootprint
+				if proc.PhysFootprint > maxFootprint {
+					maxFootprint = proc.PhysFootprint
+				}
+			}
+			attrs := []any{
 				"cpu_count", cpuUsageMsg.CPUCount,
 				"enabled_cpus", cpuUsageMsg.EnabledCPUs,
 				"end_time", cpuUsageMsg.EndMachAbsTime,
 				"cpu_total_load", cpuUsageMsg.SystemCPUUsage.CPU_TotalLoad,
-			)
+				"process_count", len(cpuUsageMsg.Processes),
+				"total_phys_footprint_bytes", totalFootprint,
+				"max_phys_footprint_bytes", maxFootprint,
+			}
+			if bundleID != "" {
+				attrs = append(attrs,
+					"app_pid", cpuUsageMsg.AppPID,
+					"app_phys_footprint_bytes", cpuUsageMsg.AppPhysFootprint,
+					"app_cpu_usage", cpuUsageMsg.AppCPUUsage,
+				)
+			}
+			slog.Info("received CPU usage data", attrs...)
 
 		case <-c:
 			slog.Info("shutting down sysmontap")

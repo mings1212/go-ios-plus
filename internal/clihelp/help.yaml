@@ -251,8 +251,8 @@ commands:
     usage: ios ostrace [--pid=<processID>] [--process=<processName>] [--level=<levels>] [--subsystem=<sub>] [--match=<str>] [--exclude=<str>] [options]
     summary: Stream os_trace_relay logs.
   - path: sysmontap
-    usage: ios sysmontap [options]
-    summary: Stream CPU and memory metrics.
+    usage: ios sysmontap [--bundleid=<bundleid>] [options]
+    summary: Stream CPU and memory metrics. When --bundleid is set, app_pid and app_phys_footprint_bytes are added to each sample.
   - path: timeformat
     usage: ios timeformat (24h | 12h | toggle | get) [--force] [options]
     summary: Manage time format setting.
